@@ -1,11 +1,25 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 
 Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+
+def _normalize_country(value):
+    if isinstance(value, str):
+        return value.strip().upper()
+    return value
+
+
+Country = Annotated[
+    str,
+    BeforeValidator(_normalize_country),
+    StringConstraints(min_length=2, max_length=2, pattern=r"^[A-Z]{2}$"),
+]
+NonNegativeInt = Annotated[int, Field(ge=0)]
 
 
 class BaseAmountIn(BaseModel):
@@ -77,3 +91,109 @@ class VersionInfo(BaseModel):
 class VersionListOut(BaseModel):
     current_version: Optional[int]
     versions: list[VersionInfo]
+
+
+# ---------------------------------------------------------- 国别明细 / 来源国
+class PendingItemIn(BaseModel):
+    amount_cents: NonNegativeInt = Field(
+        description="pending amount in integer cents, apportionable to the candidates"
+    )
+    candidates: list[Country] = Field(
+        min_length=1, description="candidate countries (ISO-style 2-letter codes)"
+    )
+
+
+class PendingItemOut(BaseModel):
+    amount_cents: int
+    candidates: list[str]
+
+
+class CountryDetailIn(BaseModel):
+    confirmed: dict[Country, NonNegativeInt] = Field(
+        default_factory=dict, description="confirmed amount per country, in cents"
+    )
+    pending: list[PendingItemIn] = Field(
+        default_factory=list, description="pending amounts with candidate countries"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "confirmed": {"CN": 100, "US": 80},
+                    "pending": [{"amount_cents": 120, "candidates": ["CN", "US"]}],
+                }
+            ]
+        }
+    }
+
+
+class CountryDetailOut(BaseModel):
+    year: int
+    code: str
+    base_amount_cents: int = Field(description="base-table amount the detail must match")
+    confirmed: dict[str, int]
+    pending: list[PendingItemOut]
+    updated_at: str
+
+
+class DetailListOut(BaseModel):
+    details: list[CountryDetailOut]
+
+
+class MissingItemOut(BaseModel):
+    code: str
+    amount_cents: int
+
+
+class AssignmentOut(BaseModel):
+    code: str = Field(description="tax code the pending amount belongs to")
+    amount_cents: int
+    candidates: list[str]
+    assigned: str = Field(description="country the amount is apportioned to")
+
+
+class ApportionmentOut(BaseModel):
+    totals: dict[str, int] = Field(description="resulting total per country")
+    leaders: list[str] = Field(
+        description="countries tied at the top; a single entry means a unique leader"
+    )
+    assignments: list[AssignmentOut]
+
+
+class EvidenceOut(BaseModel):
+    type: Literal["tie", "different_leaders"] = Field(
+        description="one apportionment with a tied first place, or two "
+        "apportionments with different leaders"
+    )
+    apportionments: list[ApportionmentOut]
+
+
+class OriginYearOut(BaseModel):
+    year: int
+    status: Literal["no_imports", "incomplete", "determined", "undetermined"]
+    codes: list[str] = Field(description="group member codes for this year")
+    group_total_cents: int
+    missing: Optional[list[MissingItemOut]] = Field(
+        default=None, description="base items still lacking details (incomplete)"
+    )
+    leader: Optional[str] = Field(
+        default=None, description="country that ranks first under every "
+        "feasible apportionment (determined)"
+    )
+    leader_min_cents: Optional[int] = Field(
+        default=None, description="worst-case total of the leader"
+    )
+    runner_up_max_cents: Optional[int] = Field(
+        default=None, description="best-case total of the strongest rival"
+    )
+    evidence: Optional[EvidenceOut] = Field(
+        default=None, description="sample apportionments for analysts (undetermined)"
+    )
+
+
+class OriginOut(BaseModel):
+    group_id: int
+    version: int = Field(description="mapping version this answer is based on")
+    years: list[int]
+    results: list[OriginYearOut]

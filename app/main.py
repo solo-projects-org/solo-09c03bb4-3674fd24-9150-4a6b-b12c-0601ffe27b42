@@ -10,8 +10,12 @@ from .schemas import (
     BaseIn,
     BaseOut,
     ChangeRecord,
+    CountryDetailIn,
+    CountryDetailOut,
+    DetailListOut,
     MappingIn,
     MappingOut,
+    OriginOut,
     SummaryOut,
     VersionListOut,
 )
@@ -28,6 +32,17 @@ DESCRIPTION = """新版税则拆并税号后的供数 API。
   应撤下组号、应写入汇总；
 * 对照漏掉底表税号或引用未知税号时整版拒收（422），原供数仍可查询；
 * 同版重传原对照返回当时的变更（200），改内容则冲突（409）。
+
+首版对照发布后开放**来源国判定**：
+
+* `PUT /details/{year}/{code}` 按年份和税号替换国别明细：已确认的国别金额 +
+  每笔待核金额及其候选国家（金额均为非负整数分，待核金额可分摊给候选国家）；
+  明细合计须等于底表，不等则 422 且保留上次明细；
+* `GET /groups/{group_id}/origin` 按现行组号逐年判定：给出在所有可行分摊下
+  都独占首位的国家；无法判定时给出一份首位并列的分摊、或两份首位不同的分摊，
+  供分析员追查；组内该年底表总额为零报无进口，总额非零而缺明细则列出缺项；
+* 一次查询的版号、组成员和国别明细取自同一已提交状态（单个 SQLite 读事务），
+  分摊计算在事务外进行，期间其他实例可继续更正明细和发布对照。
 """
 
 
@@ -123,6 +138,54 @@ def create_app(db_path: str) -> FastAPI:
         if record is None:
             raise ApiError(404, f"version {version} not found")
         return record
+
+    # ----------------------------------------------------------- 国别明细
+    @app.put(
+        "/details/{year}/{code}",
+        response_model=CountryDetailOut,
+        tags=["国别明细"],
+        summary="替换某年某税号的国别明细（首版对照发布后）",
+        description="填入已确认的国别金额与每笔待核金额及候选国家；合计须等于底表，"
+        "不等则 422 且保留上次明细；未发布对照时 409，税号不在底表时 404。",
+    )
+    def put_detail(year: int, code: str, payload: CountryDetailIn):
+        return store.put_detail(
+            year,
+            code.strip(),
+            payload.confirmed,
+            [item.model_dump() for item in payload.pending],
+        )
+
+    @app.get(
+        "/details/{year}/{code}",
+        response_model=CountryDetailOut,
+        tags=["国别明细"],
+        summary="查看某年某税号的国别明细",
+    )
+    def get_detail(year: int, code: str):
+        return store.get_detail(year, code.strip())
+
+    @app.get(
+        "/details",
+        response_model=DetailListOut,
+        tags=["国别明细"],
+        summary="列出全部国别明细",
+    )
+    def list_details():
+        return store.list_details()
+
+    # ---------------------------------------------------------- 来源国判定
+    @app.get(
+        "/groups/{group_id}/origin",
+        response_model=OriginOut,
+        tags=["来源国判定"],
+        summary="按现行组号判定来源国",
+        description="逐年给出在所有可行分摊下都独占首位的国家；无法判定时给出一份"
+        "首位并列的分摊、或两份首位不同的分摊；总额为零报无进口，缺明细列出缺项。"
+        "版号、组成员、国别明细取自同一已提交状态。",
+    )
+    def get_group_origin(group_id: int):
+        return store.get_group_origin(group_id)
 
     return app
 

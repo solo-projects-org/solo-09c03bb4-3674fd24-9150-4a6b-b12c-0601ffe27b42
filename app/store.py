@@ -21,6 +21,15 @@ Domain rules implemented here:
 * Writers are serialized (process lock + BEGIN IMMEDIATE) and the diff base
   is re-read at commit time, so concurrent submissions are applied against
   the version they actually replace.
+* Once the first mapping version is published, per-(year, code) country
+  details (confirmed country amounts plus pending amounts with candidate
+  countries) can be replaced; a detail whose total differs from the base
+  table is rejected and the previous detail is kept.
+* The origin query reads version, group members and country details inside
+  one SQLite read transaction (one committed state) and computes the
+  apportionment analysis after the transaction ends, so other instances can
+  keep correcting details and publishing mappings while it runs (WAL readers
+  never block writers).
 """
 from __future__ import annotations
 
@@ -30,6 +39,8 @@ import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
+
+from .origin import build_origin_result
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -61,6 +72,14 @@ CREATE TABLE IF NOT EXISTS current_groups (
     new_codes_json  TEXT    NOT NULL,
     old_total_cents INTEGER NOT NULL,
     new_total_cents INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS country_details (
+    year           INTEGER NOT NULL,
+    code           TEXT    NOT NULL,
+    confirmed_json TEXT    NOT NULL,
+    pending_json   TEXT    NOT NULL,
+    updated_at     TEXT    NOT NULL,
+    PRIMARY KEY (year, code)
 );
 """
 
@@ -138,6 +157,7 @@ class Store:
     def __init__(self, path: str):
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self._path = path
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout = 5000")
@@ -432,3 +452,208 @@ class Store:
                     for r in rows
                 ],
             }
+
+    # ------------------------------------------------------ country details
+    def put_detail(self, year, code, confirmed, pending):
+        """Replace the country detail of one base item.
+
+        ``confirmed`` maps country -> cents; ``pending`` is a list of
+        {"amount_cents", "candidates"} items.  The detail total must equal
+        the base-table amount, otherwise the previous detail is kept.
+        """
+        with self._lock:
+            if self._current_version() is None:
+                raise ApiError(
+                    409,
+                    "country details are accepted once the first mapping "
+                    "version is published",
+                )
+            row = self._conn.execute(
+                "SELECT amount_cents FROM amounts WHERE year = ? AND code = ?",
+                (year, code),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, f"no base amount for year {year} code {code!r}")
+            base_amount = row["amount_cents"]
+            confirmed = {c: int(v) for c, v in confirmed.items()}
+            pending = [
+                {
+                    "amount_cents": int(item["amount_cents"]),
+                    "candidates": sorted(set(item["candidates"])),
+                }
+                for item in pending
+            ]
+            total = sum(confirmed.values()) + sum(i["amount_cents"] for i in pending)
+            if total != base_amount:
+                raise ApiError(
+                    422,
+                    {
+                        "message": "detail total must equal the base-table amount; "
+                        "previous details are kept",
+                        "year": year,
+                        "code": code,
+                        "base_amount_cents": base_amount,
+                        "detail_total_cents": total,
+                    },
+                )
+            now = _now()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO country_details(year, code, confirmed_json, "
+                    "pending_json, updated_at) VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(year, code) DO UPDATE SET "
+                    "confirmed_json = excluded.confirmed_json, "
+                    "pending_json = excluded.pending_json, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        year,
+                        code,
+                        json.dumps(confirmed, ensure_ascii=False),
+                        json.dumps(pending, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            return {
+                "year": year,
+                "code": code,
+                "base_amount_cents": base_amount,
+                "confirmed": confirmed,
+                "pending": pending,
+                "updated_at": now,
+            }
+
+    @staticmethod
+    def _detail_out(year, code, base_amount, row):
+        return {
+            "year": year,
+            "code": code,
+            "base_amount_cents": base_amount,
+            "confirmed": json.loads(row["confirmed_json"]),
+            "pending": json.loads(row["pending_json"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def get_detail(self, year, code):
+        with self._lock:
+            base = self._conn.execute(
+                "SELECT amount_cents FROM amounts WHERE year = ? AND code = ?",
+                (year, code),
+            ).fetchone()
+            if base is None:
+                raise ApiError(404, f"no base amount for year {year} code {code!r}")
+            row = self._conn.execute(
+                "SELECT * FROM country_details WHERE year = ? AND code = ?",
+                (year, code),
+            ).fetchone()
+            if row is None:
+                raise ApiError(
+                    404, f"no country details for year {year} code {code!r}"
+                )
+            return self._detail_out(year, code, base["amount_cents"], row)
+
+    def list_details(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT d.*, a.amount_cents AS base_amount_cents "
+                "FROM country_details d "
+                "JOIN amounts a ON a.year = d.year AND a.code = d.code "
+                "ORDER BY d.year, d.code"
+            ).fetchall()
+            return {
+                "details": [
+                    self._detail_out(
+                        r["year"], r["code"], r["base_amount_cents"], r
+                    )
+                    for r in rows
+                ]
+            }
+
+    # ---------------------------------------------------------- origin query
+    def get_group_origin(self, group_id):
+        """Per-year source-country determination for a current group.
+
+        Version, group members and country details are read inside one
+        SQLite read transaction, so the answer reflects a single committed
+        state; the apportionment analysis runs after the transaction ends,
+        so other instances can keep correcting details and publishing
+        mappings while it runs (WAL readers never block writers).
+        """
+        if self._path == ":memory:":
+            with self._lock:
+                snapshot = self._snapshot_group(self._conn, group_id)
+        else:
+            conn = sqlite3.connect(
+                self._path, check_same_thread=False, isolation_level=None
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000")
+            try:
+                conn.execute("BEGIN")
+                try:
+                    snapshot = self._snapshot_group(conn, group_id)
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            finally:
+                conn.close()
+        if snapshot["group"] is None:
+            raise ApiError(
+                404,
+                f"group {group_id} not found in current version "
+                f"{snapshot['version']}",
+            )
+        return build_origin_result(snapshot)
+
+    def _snapshot_group(self, conn, group_id):
+        """Read version, group members, amounts and details from one state."""
+        years = self._meta_get_on(conn, "years")
+        group = conn.execute(
+            "SELECT * FROM current_groups WHERE group_id = ?", (group_id,)
+        ).fetchone()
+        snapshot = {
+            "version": self._meta_get_on(conn, "current_version"),
+            "years": years,
+            "group": None if group is None else dict(group),
+            "members": {},
+            "amounts": {},
+            "details": {},
+        }
+        if group is None or years is None:
+            return snapshot
+        members = {
+            years[0]: json.loads(group["old_codes_json"]),
+            years[1]: json.loads(group["new_codes_json"]),
+        }
+        snapshot["members"] = members
+        for year, codes in members.items():
+            if not codes:
+                continue
+            placeholders = ",".join("?" for _ in codes)
+            for r in conn.execute(
+                f"SELECT code, amount_cents FROM amounts "
+                f"WHERE year = ? AND code IN ({placeholders})",
+                (year, *codes),
+            ):
+                snapshot["amounts"][(year, r["code"])] = r["amount_cents"]
+            for r in conn.execute(
+                f"SELECT code, confirmed_json, pending_json, updated_at "
+                f"FROM country_details WHERE year = ? AND code IN ({placeholders})",
+                (year, *codes),
+            ):
+                snapshot["details"][(year, r["code"])] = {
+                    "confirmed": json.loads(r["confirmed_json"]),
+                    "pending": json.loads(r["pending_json"]),
+                    "updated_at": r["updated_at"],
+                }
+        return snapshot
+
+    @staticmethod
+    def _meta_get_on(conn, key):
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else json.loads(row["value"])
